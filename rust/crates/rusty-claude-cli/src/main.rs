@@ -7058,10 +7058,11 @@ impl AnthropicRuntimeClient {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
                             if let Some(progress_reporter) = &self.progress_reporter {
-                                progress_reporter.mark_text_phase(&text);
-                                // Once text starts streaming, silence any further
-                                // heartbeat lines — they would interleave with output.
+                                // Suppress heartbeats BEFORE updating phase text so the
+                                // heartbeat thread can never print a line that ends with
+                                // the first streamed token.
                                 progress_reporter.suppress_output();
+                                progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                 write!(out, "{rendered}")
