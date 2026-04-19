@@ -18,6 +18,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -3737,6 +3738,7 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
+        progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let runtime = build_runtime(
@@ -3748,7 +3750,7 @@ impl LiveCli {
             emit_output,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
+            progress_reporter,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -3763,11 +3765,14 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        // start interactive progress reporting for the prompt
+        let mut progress_run = InternalPromptProgressRun::start_prompt();
+        let reporter = progress_run.reporter();
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, Some(reporter))?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            "🦀 Thinking — progress below",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -3776,6 +3781,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                progress_run.finish_success();
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -3793,6 +3799,7 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                progress_run.finish_failure(&error.to_string());
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -3818,7 +3825,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, None)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -3831,7 +3838,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, None)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -6278,6 +6285,9 @@ struct InternalPromptProgressShared {
     state: Mutex<InternalPromptProgressState>,
     output_lock: Mutex<()>,
     started_at: Instant,
+    /// Set while the model is streaming a thinking block so heartbeat lines
+    /// don't interleave with the raw thinking text.
+    suppress_output: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -6306,6 +6316,25 @@ impl InternalPromptProgressReporter {
                 }),
                 output_lock: Mutex::new(()),
                 started_at: Instant::now(),
+                suppress_output: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn for_prompt() -> Self {
+        Self {
+            shared: Arc::new(InternalPromptProgressShared {
+                state: Mutex::new(InternalPromptProgressState {
+                    command_label: "Thinking",
+                    task_label: "interactive".to_string(),
+                    step: 0,
+                    phase: "starting".to_string(),
+                    detail: None,
+                    saw_final_text: false,
+                }),
+                output_lock: Mutex::new(()),
+                started_at: Instant::now(),
+                suppress_output: AtomicBool::new(false),
             }),
         }
     }
@@ -6412,12 +6441,39 @@ impl InternalPromptProgressReporter {
         self.shared.started_at.elapsed()
     }
 
+    fn suppress_output(&self) {
+        self.shared
+            .suppress_output
+            .store(true, AtomicOrdering::Relaxed);
+    }
+
+    fn resume_output(&self) {
+        self.shared
+            .suppress_output
+            .store(false, AtomicOrdering::Relaxed);
+    }
+
     fn write_line(&self, line: &str) {
+        if self
+            .shared
+            .suppress_output
+            .load(AtomicOrdering::Relaxed)
+        {
+            return;
+        }
         let _guard = self
             .shared
             .output_lock
             .lock()
             .expect("internal prompt progress output lock poisoned");
+        // Double-check after acquiring the lock — a suppress could have raced.
+        if self
+            .shared
+            .suppress_output
+            .load(AtomicOrdering::Relaxed)
+        {
+            return;
+        }
         let mut stdout = io::stdout();
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
@@ -6427,6 +6483,26 @@ impl InternalPromptProgressReporter {
 impl InternalPromptProgressRun {
     fn start_ultraplan(task: &str) -> Self {
         let reporter = InternalPromptProgressReporter::ultraplan(task);
+        reporter.emit(InternalPromptProgressEvent::Started, None);
+
+        let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
+        let heartbeat_reporter = reporter.clone();
+        let heartbeat_handle = thread::spawn(move || loop {
+            match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
+            }
+        });
+
+        Self {
+            reporter,
+            heartbeat_stop: Some(heartbeat_stop),
+            heartbeat_handle: Some(heartbeat_handle),
+        }
+    }
+
+    fn start_prompt() -> Self {
+        let reporter = InternalPromptProgressReporter::for_prompt();
         reporter.emit(InternalPromptProgressEvent::Started, None);
 
         let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
@@ -6925,6 +7001,8 @@ impl AnthropicRuntimeClient {
         let mut saw_stop = false;
         let mut received_any_event = false;
 
+        let debug_events = std::env::var_os("CLAW_DEBUG_EVENTS").is_some();
+
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
@@ -6946,6 +7024,9 @@ impl AnthropicRuntimeClient {
             let Some(event) = next else {
                 break;
             };
+            if debug_events {
+                eprintln!("RAW STREAM EVENT: {event:#?}");
+            }
             received_any_event = true;
 
             match event {
@@ -6990,15 +7071,33 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
-                        if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
-                            block_has_thinking_summary = true;
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                        if !thinking.trim().is_empty() {
+                            if !block_has_thinking_summary {
+                                block_has_thinking_summary = true;
+                                // Silence heartbeat lines for the duration of
+                                // the thinking block so they don't interleave.
+                                if let Some(reporter) = &self.progress_reporter {
+                                    reporter.suppress_output();
+                                }
+                                let _ = write!(out, "\n\x1b[2m\u{25c6} thinking\n");
+                                let _ = out.flush();
+                            }
+                            let _ = write!(out, "{thinking}");
+                            let _ = out.flush();
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
+                    if block_has_thinking_summary {
+                        // Close the dim thinking block and re-enable heartbeats.
+                        let _ = write!(out, "\x1b[0m\n");
+                        let _ = out.flush();
+                        if let Some(reporter) = &self.progress_reporter {
+                            reporter.resume_output();
+                        }
+                    }
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
@@ -7875,11 +7974,26 @@ fn render_thinking_block_summary(
     redacted: bool,
 ) -> Result<(), RuntimeError> {
     let summary = if redacted {
-        "\n▶ Thinking block hidden by provider\n".to_string()
+        "\n\x1b[2m\u{25c6} thinking (hidden by provider)\x1b[0m\n".to_string()
     } else if let Some(char_count) = char_count {
-        format!("\n▶ Thinking ({char_count} chars hidden)\n")
+        format!("\n\x1b[2m\u{25c6} thinking ({char_count} chars)\x1b[0m\n")
     } else {
-        "\n▶ Thinking hidden\n".to_string()
+        "\n\x1b[2m\u{25c6} thinking (hidden)\x1b[0m\n".to_string()
+    };
+    write!(out, "{summary}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+fn render_thinking_block_content(
+    out: &mut (impl Write + ?Sized),
+    thinking: &str,
+) -> Result<(), RuntimeError> {
+    let preview = truncate_output_for_display(thinking, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS);
+    let summary = if preview.trim().is_empty() {
+        "\n\x1b[2m\u{25c6} thinking (empty)\x1b[0m\n".to_string()
+    } else {
+        format!("\n\x1b[2m\u{25c6} thinking\n{preview}\x1b[0m\n")
     };
     write!(out, "{summary}")
         .and_then(|()| out.flush())
@@ -7919,8 +8033,14 @@ fn push_output_block(
             *pending_tool = Some((id, name, initial_input));
         }
         OutputContentBlock::Thinking { thinking, .. } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
-            *block_has_thinking_summary = true;
+            // In streaming mode ContentBlockStart fires with empty content;
+            // the actual text arrives via ThinkingDelta events so we skip
+            // rendering here. Only render when content is already present
+            // (non-streaming / response path).
+            if !thinking.is_empty() {
+                let _ = render_thinking_block_content(out, &thinking);
+                *block_has_thinking_summary = true;
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
