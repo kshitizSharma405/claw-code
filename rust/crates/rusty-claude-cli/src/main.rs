@@ -7038,6 +7038,7 @@ impl AnthropicRuntimeClient {
                             &mut events,
                             &mut pending_tool,
                             true,
+                            self.progress_reporter.as_ref(),
                             &mut block_has_thinking_summary,
                         )?;
                     }
@@ -7049,6 +7050,7 @@ impl AnthropicRuntimeClient {
                         &mut events,
                         &mut pending_tool,
                         true,
+                        self.progress_reporter.as_ref(),
                         &mut block_has_thinking_summary,
                     )?;
                 }
@@ -7057,6 +7059,9 @@ impl AnthropicRuntimeClient {
                         if !text.is_empty() {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
+                                // Once text starts streaming, silence any further
+                                // heartbeat lines — they would interleave with output.
+                                progress_reporter.suppress_output();
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                 write!(out, "{rendered}")
@@ -7158,7 +7163,7 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
-        let mut events = response_to_events(response, out)?;
+        let mut events = response_to_events(response, out, self.progress_reporter.as_ref())?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -8006,6 +8011,7 @@ fn push_output_block(
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
+    progress_reporter: Option<&InternalPromptProgressReporter>,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
     match block {
@@ -8038,7 +8044,13 @@ fn push_output_block(
             // rendering here. Only render when content is already present
             // (non-streaming / response path).
             if !thinking.is_empty() {
+                if let Some(reporter) = progress_reporter {
+                    reporter.suppress_output();
+                }
                 let _ = render_thinking_block_content(out, &thinking);
+                if let Some(reporter) = progress_reporter {
+                    reporter.resume_output();
+                }
                 *block_has_thinking_summary = true;
             }
         }
@@ -8053,6 +8065,7 @@ fn push_output_block(
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
+    progress_reporter: Option<&InternalPromptProgressReporter>,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -8065,6 +8078,7 @@ fn response_to_events(
             &mut events,
             &mut pending_tool,
             false,
+            progress_reporter,
             &mut block_has_thinking_summary,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
@@ -11376,6 +11390,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
@@ -11411,6 +11426,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
@@ -11450,6 +11466,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
